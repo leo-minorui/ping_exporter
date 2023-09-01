@@ -34,9 +34,6 @@ type pingCollector struct {
 func (p *pingCollector) Describe(ch chan<- *prometheus.Desc) {
 	p.createDesc()
 
-	if enableDeprecatedMetrics {
-		rttDesc.Describe(ch)
-	}
 	bestDesc.Describe(ch)
 	worstDesc.Describe(ch)
 	meanDesc.Describe(ch)
@@ -62,12 +59,6 @@ func (p *pingCollector) Collect(ch chan<- prometheus.Metric) {
 		l = append(l, p.customLabels.labelValues(targetConfig)...)
 
 		if metrics.PacketsSent > metrics.PacketsLost {
-			if enableDeprecatedMetrics {
-				rttDesc.Collect(ch, metrics.Best, append(l, "best")...)
-				rttDesc.Collect(ch, metrics.Worst, append(l, "worst")...)
-				rttDesc.Collect(ch, metrics.Mean, append(l, "mean")...)
-				rttDesc.Collect(ch, metrics.StdDev, append(l, "std_dev")...)
-			}
 
 			bestDesc.Collect(ch, metrics.Best, l...)
 			worstDesc.Collect(ch, metrics.Worst, l...)

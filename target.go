@@ -5,13 +5,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"go.uber.org/zap"
 	"net"
 	"strconv"
 	"sync"
 	"time"
 
 	mon "github.com/digineo/go-ping/monitor"
-	log "github.com/sirupsen/logrus"
 )
 
 // ipVersion represents the IP protocol version of an address
@@ -47,11 +47,11 @@ func (t *target) addOrUpdateMonitor(monitor *mon.Monitor, opts targetOpts) error
 	var sanitizedAddrs []net.IPAddr
 	for _, addr := range addrs {
 		if getIPVersion(addr) == ipv6 && opts.disableIPv6 {
-			log.Infof("IPv6 disabled: skipping target for host %s (%v)", t.host, addr)
+			Logger.Info("IPv6 disabled: skipping target for host %s (%v)", zap.Any(t.host, addr))
 			continue
 		}
 		if getIPVersion(addr) == ipv4 && opts.disableIPv4 {
-			log.Infof("IPv4 disabled: skipping target for host %s (%v)", t.host, addr)
+			Logger.Info("IPv4 disabled: skipping target for host %s (%v)", zap.Any(t.host, addr))
 			continue
 		}
 		sanitizedAddrs = append(sanitizedAddrs, addr)
@@ -82,7 +82,7 @@ func (t *target) cleanUp(addr []net.IPAddr, monitor *mon.Monitor) {
 	for _, o := range t.addresses {
 		if !isIPAddrInSlice(o, addr) {
 			name := t.nameForIP(o)
-			log.Infof("removing target for host %s (%v)", t.host, o)
+			Logger.Info("removing target for host %s (%v)", zap.Any(t.host, o))
 			monitor.RemoveTarget(name)
 		}
 	}
@@ -90,7 +90,7 @@ func (t *target) cleanUp(addr []net.IPAddr, monitor *mon.Monitor) {
 
 func (t *target) add(addr net.IPAddr, monitor *mon.Monitor) error {
 	name := t.nameForIP(addr)
-	log.Infof("adding target for host %s (%v)", t.host, addr)
+	Logger.Info(fmt.Sprintf("adding target for host %s %v", t.host, addr))
 
 	return monitor.AddTargetDelayed(name, addr, t.delay)
 }

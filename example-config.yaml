@@ -1,0 +1,16 @@
+targets:
+  - xdr.sangfor.com.cn
+  - baidu.com
+
+dns:
+  refresh: 2m15s
+  nameserver: 114.114.114.114
+
+ping:
+  interval: 2s
+  timeout: 3s
+  history-size: 42
+  size: 120
+
+options:
+  disableIPv6: false

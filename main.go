@@ -1,132 +1,105 @@
-// SPDX-License-Identifier: MIT
-
 package main
 
 import (
+	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
+	"github.com/czerwonk/ping_exporter/config"
+	"github.com/czerwonk/ping_exporter/pkg/log"
+	"github.com/digineo/go-ping"
+	mon "github.com/digineo/go-ping/monitor"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/expfmt"
+	"github.com/spf13/cobra"
+	"go.uber.org/zap"
 	"net"
-	"net/http"
 	"os"
 	"strings"
 	"time"
-
-	"github.com/digineo/go-ping"
-	mon "github.com/digineo/go-ping/monitor"
-
-	"github.com/czerwonk/ping_exporter/config"
-
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	log "github.com/sirupsen/logrus"
-	"gopkg.in/alecthomas/kingpin.v2"
 )
 
-const version string = "1.1.0"
+const version string = "0.0.1"
 
 var (
-	showVersion             = kingpin.Flag("version", "Print version information").Default().Bool()
-	listenAddress           = kingpin.Flag("web.listen-address", "Address on which to expose metrics and web interface").Default(":9427").String()
-	metricsPath             = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics").Default("/metrics").String()
-	serverUseTLS            = kingpin.Flag("web.tls.enabled", "Enable TLS for web server, default is false").Default().Bool()
-	serverTlsCertFile       = kingpin.Flag("web.tls.cert-file", "The certificate file for the web server").Default("").String()
-	serverTlsKeyFile        = kingpin.Flag("web.tls.key-file", "The key file for the web server").Default("").String()
-	serverMutualAuthEnabled = kingpin.Flag("web.tls.mutual-auth-enabled", "Enable TLS client mutual authentication, default is false").Default().Bool()
-	serverTlsCAFile         = kingpin.Flag("web.tls.ca-file", "The certificate authority file for client's certificate verification").Default("").String()
-	configFile              = kingpin.Flag("config.path", "Path to config file").Default("").String()
-	pingInterval            = kingpin.Flag("ping.interval", "Interval for ICMP echo requests").Default("5s").Duration()
-	pingTimeout             = kingpin.Flag("ping.timeout", "Timeout for ICMP echo request").Default("4s").Duration()
-	pingSize                = kingpin.Flag("ping.size", "Payload size for ICMP echo requests").Default("56").Uint16()
-	historySize             = kingpin.Flag("ping.history-size", "Number of results to remember per target").Default("10").Int()
-	dnsRefresh              = kingpin.Flag("dns.refresh", "Interval for refreshing DNS records and updating targets accordingly (0 if disabled)").Default("1m").Duration()
-	dnsNameServer           = kingpin.Flag("dns.nameserver", "DNS server used to resolve hostname of targets").Default("").String()
-	disableIPv6             = kingpin.Flag("options.disable-ipv6", "Disable DNS from resolving IPv6 AAAA records").Default().Bool()
-	disableIPv4             = kingpin.Flag("options.disable-ipv4", "Disable DNS from resolving IPv4 A records").Default().Bool()
-	logLevel                = kingpin.Flag("log.level", "Only log messages with the given severity or above. Valid levels: [debug, info, warn, error, fatal]").Default("info").String()
-	targets                 = kingpin.Arg("targets", "A list of targets to ping").Strings()
-
-	tailnet = kingpin.Flag("ts.tailnet", "tailnet name").String()
-)
-
-var (
-	enableDeprecatedMetrics = true // default may change in future
-	deprecatedMetrics       = kingpin.Flag("metrics.deprecated", "Enable or disable deprecated metrics (`ping_rtt_ms{type=best|worst|mean|std_dev}`). Valid choices: [enable, disable]").Default("disable").String()
-
-	rttMetricsScale = rttInMills // might change in future
-	rttMode         = kingpin.Flag("metrics.rttunit", "Export ping results as either seconds (default), or milliseconds (deprecated), or both (for migrations). Valid choices: [s, ms, both]").Default("s").String()
-)
-
-func main() {
-	kingpin.Parse()
-
-	if len(*tailnet) > 0 {
-		tsDiscover()
+	rootCmd = &cobra.Command{
+		Use:   "ping_collector",
+		Short: "ping_collector",
+		Long:  "ping_collector",
+		Args:  cobra.MinimumNArgs(0),
+		Run:   rootRun,
 	}
+	Logger          = log.InitLogger()
+	rttMetricsScale = rttInMills
+)
 
-	if *showVersion {
-		printVersion()
+func init() {
+
+	rootCmd.Flags().String("version", version, "Print version information.")
+	rootCmd.Flags().String("config.path", "", "Path to config file.")
+	rootCmd.Flags().Duration("ping.interval", 5*time.Second, "Interval between pings.")
+	rootCmd.Flags().Duration("ping.timeout", 4*time.Second, "Timeout for pings.")
+	rootCmd.Flags().Uint16("ping.size", 56, "Size of ICMP payload.")
+	rootCmd.Flags().Int("ping.history-size", 10, "Number of pings to keep in history.")
+	rootCmd.Flags().Duration("dns.refresh", 1*time.Minute, "Interval for refreshing DNS records and updating targets accordingly (0 if disabled)")
+	rootCmd.Flags().String("dns.nameserver", "", "Nameserver to use for DNS lookups (empty to use system default)")
+	rootCmd.Flags().Bool("options.disableIPv6", false, "Prohibits DNS resolved IPv6 addresses")
+	rootCmd.Flags().Bool("options.disableIPv4", false, "Prohibits DNS resolved IPv4 addresses")
+	rootCmd.Flags().String("log.level", "info", "Only log messages with the given severity or above. Valid levels: [debug, info, warn, error, fatal]")
+	rootCmd.Flags().String("ts.tailnet", "", "tailnet name")
+	rootCmd.Flags().String("metrics.rttunit", "s", "Export ping results as either seconds (default), or milliseconds (deprecated), or both (for migrations). Valid choices: [s, ms, both]")
+	rootCmd.Flags().String("outfile", "", "Output file for metrics. Default is stdout")
+
+}
+
+func rootRun(cmd *cobra.Command, args []string) {
+
+	if showVersion, _ := cmd.Flags().GetBool("version"); showVersion {
+		fmt.Println(version)
 		os.Exit(0)
 	}
 
-	setLogLevel(*logLevel)
-	log.SetReportCaller(true)
-
-	switch *deprecatedMetrics {
-	case "enable":
-		enableDeprecatedMetrics = true
-	case "disable":
-		enableDeprecatedMetrics = false
-	default:
-		kingpin.FatalUsage("metrics.deprecated must be `enable` or `disable`")
+	logLevel, _ := cmd.Flags().GetString("log.level")
+	log.SetLogLevel(logLevel)
+	rttMode, _ := cmd.Flags().GetString("metrics.rttunit")
+	if rttMetricsScale = rttUnitFromString(rttMode); rttMetricsScale == rttInvalid {
+		Logger.Fatal("metrics.rttunit must be `ms` for millis, or `s` for seconds, or `both`")
 	}
+	Logger.Sugar().Info("rttMetricsScale", rttMetricsScale)
 
-	if rttMetricsScale = rttUnitFromString(*rttMode); rttMetricsScale == rttInvalid {
-		kingpin.FatalUsage("metrics.rttunit must be `ms` for millis, or `s` for seconds, or `both`")
-	}
-	log.Infof("rtt units: %#v", rttMetricsScale)
+	configFile, _ := cmd.Flags().GetString("config.path")
 
-	if mpath := *metricsPath; mpath == "" {
-		log.Warnln("web.telemetry-path is empty, correcting to `/metrics`")
-		mpath = "/metrics"
-		metricsPath = &mpath
-	} else if mpath[0] != '/' {
-		mpath = "/" + mpath
-		metricsPath = &mpath
-	}
-
-	cfg, err := loadConfig()
+	cfg, err := config.LoadConfig(configFile)
 	if err != nil {
-		kingpin.FatalUsage("could not load config.path: %v", err)
+		Logger.Fatal("Error loading config", zap.Error(err))
 	}
 
 	if cfg.Ping.History < 1 {
-		kingpin.FatalUsage("ping.history-size must be greater than 0")
+		Logger.Fatal("ping.history-size must be greater than 0")
 	}
 
 	if cfg.Ping.Size > 65500 {
-		kingpin.FatalUsage("ping.size must be between 0 and 65500")
+		Logger.Fatal("ping.size must be less than 65500")
 	}
 
 	if len(cfg.Targets) == 0 {
-		kingpin.FatalUsage("No targets specified")
+		Logger.Fatal("No targets configured")
 	}
 
 	m, err := startMonitor(cfg)
 	if err != nil {
-		log.Errorln(err)
+		Logger.Error("Error starting monitor", zap.Error(err))
 		os.Exit(2)
 	}
 
-	startServer(cfg, m)
-}
-
-func printVersion() {
-	fmt.Println("ping-exporter")
-	fmt.Printf("Version: %s\n", version)
-	fmt.Println("Author(s): Philip Berndroth, Daniel Czerwonk")
-	fmt.Println("Metric exporter for go-icmp")
+	Logger.Info("Starting ping_exporter", zap.String("version", version))
+	if outfile, _ := cmd.Flags().GetString("outfile"); outfile != "" {
+		err := os.WriteFile(outfile, []byte(printMetrics(cfg, m)), 0644)
+		if err != nil {
+			Logger.Error("cannot write to file", zap.Error(err))
+		}
+	} else {
+		fmt.Println(printMetrics(cfg, m))
+	}
 }
 
 func startMonitor(cfg *config.Config) (*mon.Monitor, error) {
@@ -171,7 +144,7 @@ func startMonitor(cfg *config.Config) (*mon.Monitor, error) {
 			disableIPv6: cfg.Options.DisableIPv6,
 		})
 		if err != nil {
-			log.Errorln(err)
+			Logger.Sugar().Error(zap.Error(err))
 		}
 	}
 
@@ -191,7 +164,7 @@ func startDNSAutoRefresh(interval time.Duration, targets []*target, monitor *mon
 }
 
 func refreshDNS(targets []*target, monitor *mon.Monitor, cfg *config.Config) {
-	log.Infoln("refreshing DNS")
+	Logger.Sugar().Info("refreshing DNS")
 	for _, t := range targets {
 		go func(ta *target) {
 			err := ta.addOrUpdateMonitor(monitor, targetOpts{
@@ -199,109 +172,37 @@ func refreshDNS(targets []*target, monitor *mon.Monitor, cfg *config.Config) {
 				disableIPv6: cfg.Options.DisableIPv6,
 			})
 			if err != nil {
-				log.Errorf("could not refresh dns: %v", err)
+				Logger.Error("could not refresh dns", zap.Error(err))
 			}
 		}(t)
 	}
 }
 
-func startServer(cfg *config.Config, monitor *mon.Monitor) {
-	var err error
-	log.Infof("Starting ping exporter (Version: %s)", version)
-	http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprintf(w, indexHTML, *metricsPath)
-	})
-
+func printMetrics(cfg *config.Config, monitor *mon.Monitor) string {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(&pingCollector{
-		cfg:          cfg,
 		monitor:      monitor,
+		cfg:          cfg,
 		customLabels: newCustomLabelSet(cfg.Targets),
 	})
-
-	l := log.New()
-	l.Level = log.ErrorLevel
-
-	h := promhttp.HandlerFor(reg, promhttp.HandlerOpts{
-		ErrorLog:      l,
-		ErrorHandling: promhttp.ContinueOnError,
-	})
-	http.Handle(*metricsPath, h)
-
-	server := http.Server{
-		Addr: *listenAddress,
-	}
-
-	if *serverUseTLS {
-		confureTLS(&server)
-		log.Infof("Listening for %s on %s (HTTPS)", *metricsPath, *listenAddress)
-		err = server.ListenAndServeTLS("", "")
-	} else {
-		log.Infof("Listening for %s on %s (HTTP)", *metricsPath, *listenAddress)
-		err = server.ListenAndServe()
-	}
-
-	if err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
-	}
-}
-
-func confureTLS(server *http.Server) {
-	if *serverTlsCertFile == "" || *serverTlsKeyFile == "" {
-		log.Error("'web.tls.cert-file' and 'web.tls.key-file' must be defined")
-		return
-	}
-
-	server.TLSConfig = &tls.Config{
-		MinVersion: tls.VersionTLS12,
-	}
-
-	var err error
-	server.TLSConfig.Certificates = make([]tls.Certificate, 1)
-	server.TLSConfig.Certificates[0], err = tls.LoadX509KeyPair(*serverTlsCertFile, *serverTlsKeyFile)
+	// wait for metrics collected
+	time.Sleep(10 * time.Second)
+	g := prometheus.Gatherers{reg}
+	gatheredMetrics, err := g.Gather()
 	if err != nil {
-		log.Errorf("Loading certificates error: %v", err)
-		return
+		Logger.Fatal("", zap.Error(err))
 	}
 
-	if *serverMutualAuthEnabled {
-		server.TLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
-
-		if *serverTlsCAFile != "" {
-			var ca []byte
-			if ca, err = os.ReadFile(*serverTlsCAFile); err != nil {
-				log.Errorf("Loading CA error: %v", err)
-				return
-			} else {
-				server.TLSConfig.ClientCAs = x509.NewCertPool()
-				server.TLSConfig.ClientCAs.AppendCertsFromPEM(ca)
-			}
+	buf := new(bytes.Buffer)
+	for _, metric := range gatheredMetrics {
+		_, err = expfmt.MetricFamilyToOpenMetrics(buf, metric)
+		if err != nil {
+			Logger.Fatal("", zap.Error(err))
 		}
-	} else {
-		server.TLSConfig.ClientAuth = tls.NoClientCert
-	}
-}
-
-func loadConfig() (*config.Config, error) {
-	if *configFile == "" {
-		cfg := config.Config{}
-		addFlagToConfig(&cfg)
-
-		return &cfg, nil
 	}
 
-	f, err := os.Open(*configFile)
-	if err != nil {
-		return nil, fmt.Errorf("cannot load config file: %w", err)
-	}
-	defer f.Close()
+	return (buf.String())
 
-	cfg, err := config.FromYAML(f)
-	if err == nil {
-		addFlagToConfig(cfg)
-	}
-
-	return cfg, err
 }
 
 func setupResolver(cfg *config.Config) *net.Resolver {
@@ -320,54 +221,10 @@ func setupResolver(cfg *config.Config) *net.Resolver {
 	return &net.Resolver{PreferGo: true, Dial: dialer}
 }
 
-// addFlagToConfig updates cfg with command line flag values, unless the
-// config has non-zero values.
-func addFlagToConfig(cfg *config.Config) {
-	if len(cfg.Targets) == 0 {
-		cfg.Targets = make([]config.TargetConfig, len(*targets))
-		for i, t := range *targets {
-			cfg.Targets[i] = config.TargetConfig{
-				Addr: t,
-			}
-		}
-	}
-	if cfg.Ping.History == 0 {
-		cfg.Ping.History = *historySize
-	}
-	if cfg.Ping.Interval == 0 {
-		cfg.Ping.Interval.Set(*pingInterval)
-	}
-	if cfg.Ping.Timeout == 0 {
-		cfg.Ping.Timeout.Set(*pingTimeout)
-	}
-	if cfg.Ping.Size == 0 {
-		cfg.Ping.Size = *pingSize
-	}
-	if cfg.DNS.Refresh == 0 {
-		cfg.DNS.Refresh.Set(*dnsRefresh)
-	}
-	if cfg.DNS.Nameserver == "" {
-		cfg.DNS.Nameserver = *dnsNameServer
-	}
-	if !cfg.Options.DisableIPv6 {
-		cfg.Options.DisableIPv6 = *disableIPv6
-	}
-	if !cfg.Options.DisableIPv4 {
-		cfg.Options.DisableIPv4 = *disableIPv4
+func main() {
+
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
 	}
 }
-
-const indexHTML = `<!doctype html>
-<html>
-<head>
-	<meta charset="UTF-8">
-	<title>ping Exporter (Version ` + version + `)</title>
-</head>
-<body>
-	<h1>ping Exporter</h1>
-	<p><a href="%s">Metrics</a></p>
-	<h2>More information:</h2>
-	<p><a href="https://github.com/czerwonk/ping_exporter">github.com/czerwonk/ping_exporter</a></p>
-</body>
-</html>
-`

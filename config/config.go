@@ -4,9 +4,9 @@ package config
 
 import (
 	"fmt"
-	"io"
-
 	yaml "gopkg.in/yaml.v2"
+	"io"
+	"os"
 )
 
 // Config represents configuration for the exporter.
@@ -32,7 +32,7 @@ type Config struct {
 }
 
 // FromYAML reads YAML from reader and unmarshals it to Config.
-func FromYAML(r io.Reader) (*Config, error) {
+func fromYAML(r io.Reader) (*Config, error) {
 	c := &Config{}
 	err := yaml.NewDecoder(r).Decode(c)
 	if err != nil {
@@ -50,4 +50,19 @@ func (cfg *Config) TargetConfigByAddr(addr string) TargetConfig {
 	}
 
 	return TargetConfig{Addr: addr}
+}
+
+func LoadConfig(configFile string) (*Config, error) {
+	if configFile == "" {
+		return nil, fmt.Errorf("config file not specified")
+	}
+
+	f, err := os.Open(configFile)
+	if err != nil {
+		return nil, fmt.Errorf("cannot load config file: %w", err)
+	}
+	defer f.Close()
+
+	cfg, err := fromYAML(f)
+	return cfg, err
 }
